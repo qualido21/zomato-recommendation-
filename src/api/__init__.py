@@ -1,0 +1,1 @@
+# src/api — Phase 4: Backend API (FastAPI)

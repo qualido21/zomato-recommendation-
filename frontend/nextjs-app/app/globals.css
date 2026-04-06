@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --crimson: #e94560;
+  --dark-bg: #0f0f0f;
+  --card-bg: #1a1a1a;
+}
+
+body {
+  background-color: var(--dark-bg);
+  color: #f0f0f0;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #111; }
+::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #555; }
+
+/* Taste profile bar animation */
+@keyframes fillBar {
+  from { width: 0%; }
+  to { width: var(--fill); }
+}
+.fill-bar { animation: fillBar 1s ease-out forwards; }

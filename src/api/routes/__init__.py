@@ -1,0 +1,1 @@
+# src/api/routes — Phase 4: API route handlers
