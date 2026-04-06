@@ -1,18 +1,32 @@
 """
 frontend/streamlit_app.py
 ──────────────────────────
-Streamlit MVP — AI Restaurant Recommender UI.
+Self-contained Streamlit app — no FastAPI backend required.
+Imports FilterEngine and calls Groq directly.
 
 Run:
     streamlit run frontend/streamlit_app.py --server.headless true
-
-Requires the FastAPI backend running at http://localhost:8000.
 """
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
 
 import requests
 import streamlit as st
 
-API_BASE = "http://localhost:8000"
+# ── Path setup so src/* is importable ─────────────────────────────────────────
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.data.loader import load_dataset
+from src.filter.engine import CityNotFoundError, FilterEngine
+from src.filter.schemas import UserPreferences
+from src.llm.parser import LLMParseError, parse_response
+from src.llm.prompt_builder import PromptBuilder
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -88,57 +102,84 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── API helpers ───────────────────────────────────────────────────────────────
+# ── Load dataset & engine (cached) ────────────────────────────────────────────
 
-@st.cache_data(ttl=60)
-def check_api_health():
-    try:
-        r = requests.get(f"{API_BASE}/health", timeout=3)
-        return r.status_code == 200, r.json()
-    except Exception:
-        return False, {}
+DATA_PATH = ROOT / "data" / "zomato_clean.parquet"
 
 
-@st.cache_data(ttl=300)
-def fetch_locations():
-    try:
-        r = requests.get(f"{API_BASE}/locations", timeout=5)
-        r.raise_for_status()
-        return r.json()["cities"]
-    except Exception:
-        return []
+@st.cache_resource(show_spinner="Loading restaurant data…")
+def get_engine() -> FilterEngine:
+    df = load_dataset(str(DATA_PATH))
+    return FilterEngine(df)
 
 
-@st.cache_data(ttl=300)
-def fetch_cuisines():
-    try:
-        r = requests.get(f"{API_BASE}/cuisines", timeout=5)
-        r.raise_for_status()
-        return r.json()["cuisines"]
-    except Exception:
-        return []
+@st.cache_data(ttl=3600)
+def get_locations() -> list[str]:
+    return get_engine().available_cities()
 
 
-# ── API status banner ─────────────────────────────────────────────────────────
+@st.cache_data(ttl=3600)
+def get_cuisines() -> list[str]:
+    return get_engine().available_cuisines()
 
-api_ok, health = check_api_health()
-if not api_ok:
-    st.error(
-        "**Backend not reachable.** Start the API first:\n\n"
-        "`uvicorn src.api.main:app --reload --port 8000`",
-        icon="🔴",
+
+# ── Groq call (direct HTTP) ───────────────────────────────────────────────────
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.1-8b-instant"
+
+
+def call_groq(system_prompt: str, user_prompt: str, api_key: str) -> str:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 1500,
+    }
+    resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+# ── Groq API key ──────────────────────────────────────────────────────────────
+
+# Priority: Streamlit secrets → env var → .env file
+groq_key = st.secrets.get("GROQ_API_KEY", "") if hasattr(st, "secrets") else ""
+if not groq_key:
+    groq_key = os.getenv("GROQ_API_KEY", "")
+if not groq_key:
+    env_file = ROOT / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            if line.startswith("GROQ_API_KEY="):
+                groq_key = line.split("=", 1)[1].strip().strip('"')
+                break
+
+if not groq_key:
+    st.warning(
+        "**GROQ_API_KEY not set.** Add it in Streamlit Cloud → App Settings → Secrets:\n\n"
+        "```toml\nGROQ_API_KEY = \"your-key-here\"\n```",
+        icon="⚠️",
     )
+
+# ── Load data ─────────────────────────────────────────────────────────────────
+
+try:
+    engine = get_engine()
+    locations = get_locations()
+    all_cuisines = get_cuisines()
+except Exception as exc:
+    st.error(f"Failed to load dataset: {exc}", icon="🔴")
     st.stop()
 
-st.success(
-    f"API connected — LLM: **{health.get('llm_provider', 'groq').upper()}**",
-    icon="🟢",
-)
-
-locations = fetch_locations()
-all_cuisines = fetch_cuisines()
-
-# ── Session state — clear results on new search ───────────────────────────────
+# ── Session state ─────────────────────────────────────────────────────────────
 
 if "results" not in st.session_state:
     st.session_state.results = None
@@ -197,7 +238,6 @@ with left:
         type="primary",
     )
 
-    # Clear stale results when preferences change
     current_query = (location, tuple(selected_cuisines), budget_max, min_rating, extra_prefs)
     if st.session_state.last_query and st.session_state.last_query != current_query:
         st.session_state.results = None
@@ -209,78 +249,106 @@ with right:
     st.subheader("Recommendations")
 
     if search_clicked:
-        payload = {
-            "city": location,
-            "budget_max": int(budget_max),
-            "cuisines": selected_cuisines,
-            "min_rating": min_rating,
-            "extra_prefs": extra_prefs,
-        }
+        prefs = UserPreferences(
+            city=location,
+            budget_max=int(budget_max),
+            cuisines=selected_cuisines,
+            min_rating=min_rating,
+            extra_prefs=extra_prefs,
+        )
 
-        with st.spinner("Finding the best restaurants for you..."):
+        with st.spinner("Finding the best restaurants for you…"):
             try:
-                resp = requests.post(
-                    f"{API_BASE}/recommend",
-                    json=payload,
-                    timeout=30,
-                )
-            except requests.exceptions.Timeout:
-                st.error("Request timed out. Try again.", icon="⏱️")
-                st.stop()
-            except requests.exceptions.ConnectionError:
-                st.error("Could not reach the API. Is it still running?", icon="🔴")
-                st.stop()
+                filter_result = engine.run(prefs)
+            except CityNotFoundError as exc:
+                st.warning(str(exc), icon="⚠️")
+                st.session_state.results = None
+                filter_result = None
 
-        if resp.status_code == 404:
-            st.warning(resp.json().get("detail", "No results found."), icon="⚠️")
-            st.session_state.results = None
-        elif resp.status_code == 422:
-            st.error(f"Invalid input: {resp.json()}", icon="❌")
-            st.session_state.results = None
-        elif not resp.ok:
-            st.error(f"API error {resp.status_code}: {resp.text}", icon="❌")
-            st.session_state.results = None
-        else:
-            st.session_state.results = resp.json()
+        if filter_result is not None:
+            if not filter_result.candidates:
+                st.warning("No restaurants found even after relaxing filters.", icon="⚠️")
+                st.session_state.results = None
+            else:
+                recs = None
+                llm_used = False
 
-    # ── Render stored results ─────────────────────────────────────────────────
+                if groq_key:
+                    try:
+                        builder = PromptBuilder()
+                        system_prompt, user_prompt = builder.build(prefs, filter_result.candidates)
+                        with st.spinner("Asking AI for personalised recommendations…"):
+                            raw = call_groq(system_prompt, user_prompt, groq_key)
+                        recs = parse_response(raw)
+                        llm_used = True
+                    except (LLMParseError, requests.RequestException, Exception):
+                        recs = None
+
+                # Fallback: top-5 from filter
+                if recs is None:
+                    fallback = filter_result.candidates[:5]
+                    recs = [
+                        {
+                            "rank": i + 1,
+                            "name": r.name,
+                            "cuisine": ", ".join(r.cuisines) if r.cuisines else "—",
+                            "rating": r.rating or 0.0,
+                            "estimated_cost": f"₹{r.approx_cost} for two" if r.approx_cost else "N/A",
+                            "explanation": "",
+                        }
+                        for i, r in enumerate(fallback)
+                    ]
+
+                st.session_state.results = {
+                    "recs": [
+                        r if isinstance(r, dict) else r.model_dump()
+                        for r in recs
+                    ],
+                    "total": filter_result.total_before_limit,
+                    "relaxed": filter_result.filters_relaxed,
+                    "llm_used": llm_used,
+                    "message": filter_result.message,
+                }
+
+    # ── Render results ────────────────────────────────────────────────────────
 
     if st.session_state.results:
         data = st.session_state.results
-        recs = data["recommendations"]
-        total = data["total_candidates"]
-        relaxed = data.get("filters_relaxed", False)
-        llm_used = data.get("llm_used", True)
+        recs = data["recs"]
+        total = data["total"]
+        relaxed = data["relaxed"]
+        llm_used = data["llm_used"]
         message = data.get("message") or ""
 
-        # Summary bar
         parts = [f"**{total}** restaurants matched"]
         if relaxed:
             parts.append("⚠️ filters relaxed")
         if not llm_used:
-            parts.append("🔄 AI fallback (filter results)")
+            parts.append("🔄 AI unavailable — showing filter results")
         st.caption(" · ".join(parts) + f" · showing top **{len(recs)}**")
 
         if message and message not in ("no_results",):
             st.info(message, icon="ℹ️")
 
         for r in recs:
+            cuisine_val = r.get("cuisine", "")
             cuisine_chips = "".join(
                 f'<span class="chip">{c.strip()}</span>'
-                for c in r["cuisine"].split(",")
+                for c in cuisine_val.split(",")
             )
             explanation_html = (
                 f'<div class="explanation">{r["explanation"]}</div>'
                 if r.get("explanation")
                 else ""
             )
+            rating_val = r.get("rating") or 0
             st.markdown(f"""
             <div class="card">
                 <span class="rank-badge">{r['rank']}</span>
                 <span class="restaurant-name">{r['name']}</span>
                 <div class="meta-line">{cuisine_chips}</div>
                 <div class="meta-line">
-                    ⭐ <strong>{r['rating']}</strong>
+                    ⭐ <strong>{rating_val}</strong>
                     &nbsp;&nbsp;
                     💰 <strong>{r['estimated_cost']}</strong>
                 </div>
