@@ -3,17 +3,19 @@ export const dynamic = 'force-dynamic';
 import { UtensilsCrossed } from 'lucide-react';
 import Navbar from '@/components/Navbar';
 import AppShell from '@/components/AppShell';
-import { fetchLocations, fetchCuisines, fetchHealth } from '@/lib/api';
+import { fetchAllRestaurants } from '@/lib/supabase';
 
-// Parallel server-side data fetch (no waterfall)
+// Fetch directly from Supabase — no HTTP round-trip to own API routes
 async function getPageData() {
   try {
-    const [locations, cuisines, health] = await Promise.all([
-      fetchLocations(),
-      fetchCuisines(),
-      fetchHealth(),
-    ]);
-    return { locations, cuisines, llmProvider: health.llm_provider, apiOk: true };
+    const rows = await fetchAllRestaurants();
+    const locations = [...new Set(rows.map((r) => r.location).filter(Boolean))].sort();
+    const allCuisines: string[] = [];
+    for (const r of rows) {
+      if (Array.isArray(r.cuisines)) allCuisines.push(...r.cuisines);
+    }
+    const cuisines = [...new Set(allCuisines.filter(Boolean))].sort();
+    return { locations, cuisines, llmProvider: 'groq', apiOk: true };
   } catch {
     return { locations: [], cuisines: [], llmProvider: 'groq', apiOk: false };
   }
@@ -61,12 +63,9 @@ export default async function HomePage() {
           <div className="bg-red-900/20 border border-red-500/30 rounded-xl px-4 py-3 flex items-center gap-3">
             <div className="w-2 h-2 rounded-full bg-red-400" />
             <div>
-              <p className="text-red-400 text-sm font-semibold">Backend not reachable</p>
+              <p className="text-red-400 text-sm font-semibold">Could not load restaurant data</p>
               <p className="text-red-400/60 text-xs mt-0.5">
-                Start the API first:{' '}
-                <code className="bg-red-900/30 px-1.5 py-0.5 rounded text-red-300 font-mono text-xs">
-                  uvicorn src.api.main:app --reload --port 8000
-                </code>
+                Check that SUPABASE_URL and SUPABASE_KEY are set in Vercel environment variables.
               </p>
             </div>
           </div>
