@@ -22,7 +22,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.data.loader import load_dataset
+from src.data.loader import load_clean
+from src.data.supabase_loader import load_from_supabase
 from src.filter.engine import CityNotFoundError, FilterEngine
 from src.filter.schemas import UserPreferences
 from src.llm.parser import LLMParseError, parse_response
@@ -103,13 +104,20 @@ st.markdown("""
 
 
 # ── Load dataset & engine (cached) ────────────────────────────────────────────
+# Priority: Supabase (if credentials set) → local parquet fallback
 
 DATA_PATH = ROOT / "data" / "zomato_clean.parquet"
 
 
 @st.cache_resource(show_spinner="Loading restaurant data…")
 def get_engine() -> FilterEngine:
-    df = load_dataset(str(DATA_PATH))
+    supabase_url = st.secrets.get("SUPABASE_URL", "") if hasattr(st, "secrets") else ""
+    supabase_key = st.secrets.get("SUPABASE_KEY", "") if hasattr(st, "secrets") else ""
+
+    if supabase_url and supabase_key:
+        df = load_from_supabase(supabase_url, supabase_key)
+    else:
+        df = load_clean(DATA_PATH)
     return FilterEngine(df)
 
 
